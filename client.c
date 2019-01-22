@@ -13,6 +13,7 @@
 
 client *clients;
 int clients_max = 0;
+int client_acl;
 
 /* Store client and return index */
 int store_client(struct sockaddr_storage *cli)
@@ -73,15 +74,17 @@ int store_client(struct sockaddr_storage *cli)
 	if (i == clients_max) {
 		if (empty != -1) i = empty;
 		else i = oldest;
+		DEBUG(2, "Resetting client stats for slot %d", i);
 		clients[i].connects = 0;
 		clients[i].csx = 0;
 		clients[i].crx = 0;
+		clients[i].server = NO_SERVER;
 	}
 
 	clients[i].last = now;
 	clients[i].addr = *cli;
-	clients[i].server = NO_SERVER;
 	clients[i].connects++;
+	
 
 	DEBUG(2, "Client %s has index %d", pen_ntoa(cli), i);
 

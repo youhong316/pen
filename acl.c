@@ -27,7 +27,6 @@ GeoIP *geoip4, *geoip6;
 static int nacls[ACLS_MAX];
 static acl *acls[ACLS_MAX];
 static unsigned char mask_ipv6[129][16];
-int client_acl, control_acl;
 
 static void init_mask(void)
 {
@@ -236,8 +235,10 @@ static int match_acl_ipv6(int a, struct sockaddr_in6 *cli_addr)
 	return !permit;
 }
 
+/* returns nonzero if the acl is matched, zero otherwise */
 int match_acl(int a, struct sockaddr_storage *cli_addr)
 {
+	if (a < 0 || a > ACLS_MAX) return 0;	/* acl out of bounds */
 	switch (cli_addr->ss_family) {
 #ifndef WINDOWS
 	case AF_UNIX:

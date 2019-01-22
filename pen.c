@@ -1,5 +1,5 @@
 /*
-   Copyright (C) 2000-2015  Ulric Eriksson <ulric@siag.nu>
+   Copyright (C) 2000-2016  Ulric Eriksson <ulric@siag.nu>
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -104,15 +104,18 @@ static FILE *pidfp = NULL;
 static char *webfile = NULL;
 static char listenport[1000];
 static int port;
+static int peek = 0;
 
+static int control_acl;
 static char *ctrlport = NULL;
-int listenfd;
+int listenfd = -1;
 static int ctrlfd = -1;
 static char *jail = NULL;
 static char *user = NULL;
-static char *proto = "tcp";
 
 static char *dsr_if, *dsr_ip;
+
+struct sockaddr_storage *source = NULL;
 
 #ifdef WINDOWS
 /* because Windows scribbles over errno in an uncalled-for manner */
@@ -530,25 +533,37 @@ static int rewrite_request(int i, int n, char *b)
 		q = strstr(b, "\n\n");
 	}
 	if (!q) return n;		/* not a header */
-#if 0	/* how is that supposed to happen? */
-	if (q >= b+n) return n;		/* outside of buffer */
-#endif
+
 	/* Look for existing X-Forwarded-For */
 	DEBUG(2, "Looking for X-Forwarded-For");
-
-	if (pen_strcasestr(b, "\nX-Forwarded-For:")) return n;
-
-	DEBUG(2, "Adding X-Forwarded-For");
-	/* Didn't find one, add our own */
-	snprintf(p, sizeof p, "\r\nX-Forwarded-For: %s",
-		pen_ntoa(&clients[conns[i].client].addr));
-	pl=strlen(p);
-	if (n+pl > BUFFER_MAX) return n;
-
-	memmove(q+pl, q, b+n-q);
-	memmove(q, p, pl);
-
-	n += pl;
+	if (!pen_strcasestr(b, "\nX-Forwarded-For:"))
+	{
+		DEBUG(2, "Adding X-Forwarded-For");
+		/* Didn't find one, add our own */
+		snprintf(p, sizeof p, "\r\nX-Forwarded-For: %s",
+			pen_ntoa(&clients[conns[i].client].addr));
+		pl=strlen(p);
+		if (n+pl > BUFFER_MAX) return n;
+		memmove(q+pl, q, b+n-q);
+		memmove(q, p, pl);
+		n += pl;
+	}
+	b[n] = '\0';
+	if (!pen_strcasestr(b, "\nX-Forwarded-Proto:")){
+		DEBUG(2, "Adding X-Forwarded-Proto");
+		/* Didn't find one, add our own */
+		#ifdef HAVE_LIBSSL
+		snprintf(p, sizeof p, "\r\nX-Forwarded-Proto: %s",
+			(conns[i].ssl)?"https":"http");
+		#else
+		snprintf(p, sizeof p, "\r\nX-Forwarded-Proto: %s","http");
+		#endif  /* HAVE_LIBSSL */
+		pl=strlen(p);
+		if (n+pl > BUFFER_MAX) return n;
+		memmove(q+pl, q, b+n-q);
+		memmove(q, p, pl);
+		n += pl;
+	}
 	return n;
 }
 
@@ -696,6 +711,7 @@ static int copy_up(int i)
 		}
 
 		n = my_send(to, b, rc, 0);	/* no ssl here */
+		conns[i].state &= ~CS_HALFDEAD;
 		SAVE_ERRNO;
 
 		DEBUG(2, "copy_up: send(%d, %p, %d, 0) returns %d, socket_errno = %d",
@@ -774,11 +790,8 @@ static int copy_down(int i)
 		int n;
 
 		if (udp) {
-			struct sockaddr_storage *ss = &clients[conns[i].client].addr;
-			socklen_t sss = pen_ss_size(ss);
-			DEBUG(2, "copy_down sending %d bytes to socket %d", rc, to);
-			n = sendto(to, (void *)b, rc, 0, (struct sockaddr *)ss, sss);
-			close_conn(i);
+			n = send(to, (void *)b, rc, 0);
+			conns[i].state = CS_CONNECTED;
 			return 0;
 		}
 
@@ -848,6 +861,7 @@ static void usage(void)
 	       "  -T sec    tracking time in seconds (0 = forever) [%d]\n"
 	       "  -H	add X-Forwarded-For header in http requests\n"
 	       "  -U	use udp protocol support\n"
+	       "  -N	use hash for initial server selection without save server\n"
 	       "  -O option	use option in penctl format\n"
 	       "  -P	use poll() rather than select()\n"
 	       "  -Q    use kqueue to manage events (BSD)\n"
@@ -917,26 +931,26 @@ static void init(int argc, char **argv)
 {
 	int i;
 	int server;
+	int proto;
 
 	DEBUG(2, "init(%d, %p); port = %d", argc, argv, port);
 
-#if 0
-	conns = pen_calloc(connections_max, sizeof *conns);
-	clients = pen_calloc(clients_max, sizeof *clients);
-#else
 	debug("Before: conns = %p, connections_max = %d, clients = %p, clients_max = %d",
 		conns, connections_max, clients, clients_max);
 	if (connections_max == 0) expand_conntable(CONNECTIONS_MAX);
 	if (clients_max == 0) expand_clienttable(CLIENTS_MAX);
 	debug("After: conns = %p, connections_max = %d, clients = %p, clients_max = %d",
 		conns, connections_max, clients, clients_max);
-#endif
 
 	current = 0;
 
 	server = 0;
 
+	if (udp) proto = SOCK_DGRAM;
+	else proto = SOCK_STREAM;
+
 	for (i = 1; i < argc; i++) {
+		DEBUG(2, "server[%d] = %s", server, argv[i]);
 		expand_servertable(server+1);
 		servers[server].status = 0;
 		servers[server].c = 0;	/* connections... */
@@ -947,6 +961,7 @@ static void init(int argc, char **argv)
 	}
 
 	if (e_server) {
+		DEBUG(2, "Emergency server = %s", e_server);
 		expand_servertable(EMERGENCY_SERVER+1);
 		emerg_server = EMERGENCY_SERVER;
 		servers[EMERGENCY_SERVER].status = 0;
@@ -958,6 +973,7 @@ static void init(int argc, char **argv)
 	}
 
 	if (a_server) {
+		DEBUG(2, "Abuse server = %s", a_server);
 		expand_servertable(ABUSE_SERVER+1);
 		abuse_server = ABUSE_SERVER;
 		servers[ABUSE_SERVER].status = 0;
@@ -976,14 +992,6 @@ static void init(int argc, char **argv)
 		clients[i].csx = 0;
 		clients[i].crx = 0;
 	}
-#if 0
-	for (i = 0; i < connections_max; i++) {
-		conns[i].upfd = -1;
-		conns[i].downfd = -1;
-		conns[i].upn = 0;
-		conns[i].downn = 0;
-	}
-#endif
 
 	if (debuglevel) {
 		debug("%s starting", PACKAGE_STRING);
@@ -1051,7 +1059,7 @@ static int open_unix_listener(char *a)
 }
 #endif
 
-static int open_listener(char *a)
+static int open_listener(char *a, int proto)
 {
 	int listenfd;
 	struct sockaddr_storage ss;
@@ -1093,11 +1101,14 @@ static int open_listener(char *a)
 	}
 	pen_setport(&ss, port);
 
-	listenfd = socket_nb(ss.ss_family, protoid, 0);
+	listenfd = socket_nb(ss.ss_family, proto, 0);
 	DEBUG(2, "local address=[%s:%d]", b, port);
 
 	setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, (void *)&one, sizeof one);
 	setsockopt(listenfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&optval, sizeof optval);
+#ifdef SO_REUSEPORT
+	setsockopt(listenfd, SOL_SOCKET, SO_REUSEPORT, (void *)&one, sizeof one);
+#endif
 
 	if (bind(listenfd, (struct sockaddr *)&ss, pen_ss_size(&ss)) < 0) {
 		error("can't bind local address");
@@ -1194,11 +1205,11 @@ static void do_cmd(char *b, void (*output)(void *, char *, ...), void *op)
 	int n;
 	FILE *fp;
 
-	DEBUG(2, "do_cmd(%s, %p, %p)", b, output, op);
 	p = strchr(b, '\r');
 	if (p) *p = '\0';
 	p = strchr(b, '\n');
 	if (p) *p = '\0';
+	DEBUG(2, "do_cmd(%s, %p, %p)", b, output, op);
 	p = strtok(b, " ");
 	if (p == NULL) return;
 	if (!strcmp(p, "abort_on_error")) {
@@ -1232,12 +1243,6 @@ static void do_cmd(char *b, void (*output)(void *, char *, ...), void *op)
 				} else {
 					ma = "128";
 				}
-#if 0
-				if (inet_pton(AF_INET6, ip, ipaddr) != 1) {
-					debug("acl: can't convert address %s", ip);
-					return;
-				}
-#else
 				struct sockaddr_storage ss;
 				struct sockaddr_in6 *si6;
 				if (pen_aton(ip, &ss) != 1) {
@@ -1250,7 +1255,6 @@ static void do_cmd(char *b, void (*output)(void *, char *, ...), void *op)
 				}
 				si6 = (struct sockaddr_in6 *)&ss;
 				memcpy(ipaddr, &si6->sin6_addr, sizeof ipaddr);
-#endif
 				add_acl_ipv6(a, ipaddr, atoi(ma), permit);
 			} else {
 				struct in_addr ipaddr, mask;
@@ -1308,7 +1312,7 @@ static void do_cmd(char *b, void (*output)(void *, char *, ...), void *op)
 		}
 	} else if (!strcmp(p, "conn_max")) {
 		p = strtok(NULL, " ");
-		if (p) expand_clienttable(atoi(p));
+		if (p) expand_conntable(atoi(p));
 		output(op, "%d\n", connections_max);
 	} else if (!strcmp(p, "control")) {
 		output(op, "%s\n", ctrlport);
@@ -1376,7 +1380,7 @@ static void do_cmd(char *b, void (*output)(void *, char *, ...), void *op)
 				n = close(listenfd);
 				DEBUG(2, "close(listenfd=%d) returns %d", listenfd, n);
 			}
-			listenfd = open_listener(p);
+			listenfd = open_listener(p, udp ? SOCK_DGRAM : SOCK_STREAM);
 			/* we may need to defer this if we haven't called event_init yet */
 			if (event_add) event_add(listenfd, EVENT_READ);
 			DEBUG(2, "new listenfd = %d", listenfd);
@@ -1423,6 +1427,8 @@ static void do_cmd(char *b, void (*output)(void *, char *, ...), void *op)
 			logfile = NULL;
 			if (logfp) fclose(logfp);
 			logfp = NULL;
+		} else if (!strcmp(p, "peek")) {
+			peek = 0;
 		} else if (!strcmp(p, "prio")) {
 			server_alg &= ~ALG_PRIO;
 		} else if (!strcmp(p, "roundrobin")) {
@@ -1438,6 +1444,8 @@ static void do_cmd(char *b, void (*output)(void *, char *, ...), void *op)
 		} else if (!strcmp(p, "weight")) {
 			server_alg &= ~ALG_WEIGHT;
 		}
+	} else if (!strcmp(p, "peek")) {
+		peek = 1;
 	} else if (!strcmp(p, "pending_max")) {
 		p = strtok(NULL, " ");
 		if (p) pending_max = atoi(p);
@@ -1510,6 +1518,15 @@ static void do_cmd(char *b, void (*output)(void *, char *, ...), void *op)
 		int fd = p ? atoi(p) : 0;
 		int conn = fd2conn_get(fd);
 		output(op, "Socket %d belongs to connection %d\n", fd, conn);
+	} else if (!strcmp(p, "source")) {
+		p = strtok(NULL, " ");
+		if (!source) source = pen_malloc(sizeof *source);
+		if (pen_aton(p, source) == 0) {
+			debug("pen_aton(%d, source) returns 0", p);
+			output(op, "unable to set source address to '%s'", p);
+			free(source);
+			source = NULL;
+		}
 	} else if (!strcmp(p, "status")) {
 		if (webstats()) {
 			fp = fopen(webfile, "r");
@@ -1588,6 +1605,12 @@ static void do_cmd(char *b, void (*output)(void *, char *, ...), void *op)
 		} else {
 			tcp_fastclose = 0;
 		}
+	} else if (!strcmp(p, "tarpit_acl")) {
+		p = strtok(NULL, " ");
+		if (p) tarpit_acl = atoi(p);
+		if (tarpit_acl < -1 || tarpit_acl >= ACLS_MAX)
+			tarpit_acl = 0;
+		output(op, "tarpit_acl = %d", tarpit_acl);
 	} else if (!strcmp(p, "tcp_nodelay")) {
 		tcp_nodelay = 1;
 	} else if (!strcmp(p, "timeout")) {
@@ -1712,7 +1735,10 @@ static void add_client(int downfd, struct sockaddr_storage *cli_addr)
 
 	/* we don't know the client address for udp until we read the message */
 	if (udp) {
+		int n, one = 1;
 		socklen_t len = sizeof *cli_addr;
+		struct sockaddr_storage listenaddr;
+		socklen_t listenlen = sizeof listenaddr;
 		rc = recvfrom(listenfd, (void *)b, sizeof b, 0, (struct sockaddr *)cli_addr, &len);
 		DEBUG(2, "add_client: received %d bytes from client", rc);
 		if (rc < 0) {
@@ -1720,7 +1746,40 @@ static void add_client(int downfd, struct sockaddr_storage *cli_addr)
 				debug("Error receiving data");
 			return;
 		}
+	/* we need a downfd for udp as well */
+		downfd = socket_nb(cli_addr->ss_family, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+		if (downfd == -1) {
+			debug("Can't create downfd");
+			return;
+		}
+#ifdef SO_REUSEPORT
+		setsockopt(downfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+#endif
+		n = getsockname(listenfd, (struct sockaddr *)&listenaddr, &listenlen);
+		if (n != 0) {
+			debug("getsockname returns %d, errno = %d", n, errno);
+			close(downfd);
+			return;
+		}
+		if (listenlen > sizeof listenaddr) {
+			debug("getsockaddr returns address that is too large for the buffer");
+			close(downfd);
+			return;
+		}
+		n = bind(downfd, (struct sockaddr *)&listenaddr, listenlen);
+		if (n != 0) {
+			debug("bind returns %d, errno = %d", n, errno);
+			close(downfd);
+			return;
+		}
+		n = connect(downfd, (struct sockaddr *)cli_addr, pen_ss_size(cli_addr));
+		if (n != 0) {
+			debug("connect (downfd = %d) returns %d, errno = %d", downfd, n, errno);
+			close(downfd);
+			return;
+		}
 	}
+
 	client = store_client(cli_addr);	// no server yet
 	DEBUG(2, "store_client returns %d", client);
 
@@ -1743,7 +1802,16 @@ static void add_client(int downfd, struct sockaddr_storage *cli_addr)
 		return;
 	}
 
-	conns[conn].initial = initial_server(conn);
+	if (peek) {	/* we'll choose a server later */
+		DEBUG(2, "We'll choose a server later");
+		conns[conn].initial = -1;
+		conns[conn].upfd = -1;
+		conns[conn].state = CS_WAIT_PEEK;
+		event_add(conns[conn].downfd, EVENT_READ);
+		return;
+	}
+
+	conns[conn].initial = conns[conn].server = initial_server(conn);
 	if (conns[conn].initial == -1) {
 		DEBUG(1, "No initial server found, giving up");
 		close_conn(conn);
@@ -1761,6 +1829,7 @@ static void add_client(int downfd, struct sockaddr_storage *cli_addr)
 	if (udp && rc > 0) {	/* pass on the message */
 		/* we are "connected" and don't need sendto */
 		rc = send(conns[conn].upfd, (void *)b, rc, 0);
+		conns[conn].state &= ~CS_HALFDEAD;
 		DEBUG(2, "add_client: wrote %d bytes to socket %d", rc, conns[conn].upfd);
 	}
 }
@@ -1793,11 +1862,13 @@ static int flush_down(int i)
 	struct sockaddr name;
 	size_t size = sizeof(struct sockaddr);
 
-	if (!udp)
+	if (!udp) {
 		n = my_send(conns[i].downfd, conns[i].downbptr, conns[i].downn, 0);
-	else
+	} else {
 		n = sendto(conns[i].downfd, (void *)conns[i].downbptr, conns[i].downn, 0,
 			(struct sockaddr *) &name, size);
+		conns[i].state &= ~CS_HALFDEAD;
+	}
 	err = socket_errno;
 #endif  /* HAVE_LIBSSL */
 
@@ -1836,11 +1907,13 @@ static int flush_up(int i)
        struct sockaddr name;
        size_t size = sizeof(struct sockaddr);
 
-	if (!udp)
+	if (!udp) {
 		n = my_send(conns[i].upfd, conns[i].upbptr, conns[i].upn, 0);
-	else
+	} else {
 		n = sendto(conns[i].upfd, (void *)conns[i].upbptr, conns[i].upn, 0,
 			(struct sockaddr *) &name, size);
+		conns[i].state &= ~CS_HALFDEAD;
+	}
 	err = socket_errno;
 
 	DEBUG(2, "flush_up(%d): send(%d, %p, %d, 0) returns %d, errno = %d, socket_errno = %d", \
@@ -1863,20 +1936,6 @@ static int flush_up(int i)
 		conns[i].ssx += n;
 	}
 	return n;
-}
-
-/* For UDP, connection attempts to unreachable servers would sit in the
-   connection table forever unless we remove them by force.
-   This function is pretty brutal, it simply vacates the next slot
-   after the most recently used one. This will always succeed.
-*/
-static void recycle_connection(void)
-{
-	int i;
-
-	i = connections_last+1;
-	if (i >= connections_max) i = 0;
-	close_conn(i);
 }
 
 #ifndef WINDOWS
@@ -1949,7 +2008,7 @@ static void check_listen_socket(void)
 		dsr_frame(listenfd);
 	} else if (udp) {
 		/* special case for udp */
-		downfd = listenfd;
+		downfd = 0;
 		add_client(downfd, &cli_addr);
 	} else {
 	/* process tcp connection(s) */
@@ -2011,7 +2070,7 @@ static void check_if_connected(int i)
 		return;
 	}
 	DEBUG(2, "Connection %d completed", i);
-	if (conns[i].state == CS_IN_PROGRESS) {
+	if (conns[i].state & CS_IN_PROGRESS) {
 		pending_list = dlist_remove(conns[i].pend);
 		pending_queue--;
 	}
@@ -2089,7 +2148,9 @@ static void arm_listenfd(void)
 {
 	static int can_accept = 0;
 
-	if (can_accept) {
+	if (udp) {
+		event_arm(listenfd, EVENT_READ);
+	} else if (can_accept) {
 		if (connections_used >= connections_max) {
 			event_arm(listenfd, 0);
 			can_accept = 0;
@@ -2126,32 +2187,37 @@ static int handle_events(int *pending_close)
                 conn = fd2conn_get(fd);
 		DEBUG(3, "fd = %d => conn = %d", fd, conn);
 		if (conn == -1) continue;
-                if (conns[conn].state & CS_IN_PROGRESS) {
+
+		if (events & EVENT_ERR) {
+			DEBUG(2, "Error on fd %d, connection %d", fd, conn);
+			conns[conn].state |= CS_CLOSED;
+		} else if (conns[conn].state & CS_IN_PROGRESS) {
                         if (fd == conns[conn].upfd && events & EVENT_WRITE) {
                                 check_if_connected(conn);
                         }
-                        continue;
-                }
-		conns[conn].t = now;
-                if (fd == conns[conn].downfd) {
-                        if (!udp && (events & EVENT_READ)) {
-                                if (!try_copy_up(conn)) closing = 1;
-                        }
-                        if (events & EVENT_WRITE) {
-                                if (!try_flush_down(conn)) closing = 1;
-                        }
-                } else {        /* down */
-                        if (events & EVENT_READ) {
-                                if (!try_copy_down(conn)) closing = 1;
-                        }
-                        if (!udp && (events & EVENT_WRITE)) {
-                                if (!try_flush_up(conn)) closing = 1;
-                        }
-                }
-		if (conns[conn].state == CS_CLOSED) {
+                } else {
+			conns[conn].t = now;
+                	if (fd == conns[conn].downfd) {
+                        	if (events & EVENT_READ) {
+                                	if (!try_copy_up(conn)) closing = 1;
+                        	}
+                        	if (events & EVENT_WRITE) {
+                                	if (!try_flush_down(conn)) closing = 1;
+                        	}
+                	} else {        /* down */
+                        	if (events & EVENT_READ) {
+                                	if (!try_copy_down(conn)) closing = 1;
+                        	}
+                        	if (events & EVENT_WRITE) {
+                                	if (!try_flush_up(conn)) closing = 1;
+                        	}
+                	}
+		}
+		if ((conns[conn].state & CS_CLOSED) == CS_CLOSED) {
 			DEBUG(2, "Connection %d was closed", conn);
 			closing = 1;
 		}
+
 		if (closing) {
 			pending_close[npc++] = conn;
 		}
@@ -2161,17 +2227,21 @@ static int handle_events(int *pending_close)
 
 static void pending_and_closing(int *pending_close, int npc)
 {
-	int j, p, start;
+	int j, p, start, npe;
 
 	if (pending_list != -1) {
+		npe = npc;
 		p = start = pending_list;
 		do {
 			int conn = dlist_value(p);
-			if (conns[conn].state == CS_IN_PROGRESS) {
-				check_if_timeout(conn);
+			if (conns[conn].state & CS_IN_PROGRESS) {
+				pending_close[npe++] = conn;
 			}
 			p = dlist_next(p);
 		} while (p != start);
+		for (j = npc; j < npe; j++) {
+			check_if_timeout(pending_close[j]);
+		}
 	}
         for (j = 0; j < npc; j++) {
 		int conn = pending_close[j];
@@ -2222,7 +2292,6 @@ void mainloop(void)
         while (loopflag) {
                 check_signals();
 		if (dsr_if) dsr_arp(listenfd);
-                if (udp && (connections_used >= connections_max)) recycle_connection();
 		arm_listenfd();
                 event_wait();
                 now = time(NULL);
@@ -2239,9 +2308,9 @@ static int options(int argc, char **argv)
 	char b[1024];
 
 #ifdef HAVE_LIBSSL
-	char *opt = "B:C:F:O:S:T:b:c:e:i:j:l:m:o:p:q:t:u:w:x:DHPQWXUadfhnrsE:K:G:A:ZRL:";
+	char *opt = "B:C:F:O:S:T:b:c:e:i:j:l:m:o:p:q:t:u:w:x:DHNPQWXUadfhnrsE:K:G:A:ZRL:";
 #else
-	char *opt = "B:C:F:O:S:T:b:c:e:i:j:l:m:o:p:q:t:u:w:x:DHPQWXUadfhnrs";
+	char *opt = "B:C:F:O:S:T:b:c:e:i:j:l:m:o:p:q:t:u:w:x:DHNPQWXUadfhnrs";
 #endif
 
 	while ((c = getopt(argc, argv, opt)) != -1) {
@@ -2266,7 +2335,8 @@ static int options(int argc, char **argv)
 			do_cmd(optarg, output_file, stdout);
 			break;
 		case 'Q':
-			event_init = kqueue_init;
+			fprintf(stderr, "Since Pen 0.26.0, kqueue is already the default on supported systems,\n"
+					"making the -Q option obsolete\n");
 			break;
 		case 'P':
 			event_init = poll_init;
@@ -2294,11 +2364,7 @@ static int options(int argc, char **argv)
 			blacklist_time = atoi(optarg);
 			break;
 		case 'c':
-#if 0
-			clients_max = atoi(optarg);
-#else
 			expand_clienttable(atoi(optarg));
-#endif
 			break;
 		case 'd':
 			debuglevel++;
@@ -2371,11 +2437,7 @@ static int options(int argc, char **argv)
 #endif
 			break;
 		case 'x':
-#if 0
-			connections_max = atoi(optarg);
-#else
 			expand_conntable(atoi(optarg));
-#endif
 			break;
 		case 'w':
 			webfile = pen_strdup(optarg);
@@ -2433,11 +2495,6 @@ int main(int argc, char **argv)
 	argc -= n;
 	argv += n;
 
-#ifndef WINDOWS
-	if (argc < 1) {
-		usage();
-	}
-#endif
 	now = time(NULL);
 #ifdef WINDOWS
 	start_winsock();
@@ -2446,6 +2503,10 @@ int main(int argc, char **argv)
 	read_cfg(cfgfile);
 
 #ifndef WINDOWS
+	if (listenfd == -1 && argc < 1) {
+		usage();
+	}
+
 	struct rlimit r;
 	getrlimit(RLIMIT_CORE, &r);
 	r.rlim_cur = r.rlim_max;
@@ -2464,26 +2525,23 @@ int main(int argc, char **argv)
 		if (getuid() == 0 && user == NULL) {
 			debug("Won't open control port running as root; use -u to run as different user");
 		} else {
-			ctrlfd = open_listener(ctrlport);
+			ctrlfd = open_listener(ctrlport, SOCK_STREAM);
 		}
 	}
 
 
 	/* Balancing port */
-	if (udp) {
-		protoid = SOCK_DGRAM;
-		proto = "udp";
-	}
-
-	snprintf(listenport, sizeof listenport, "%s", argv[0]);
-	/* Direct server return */
-	if (dsr_if) {
-		listenfd = dsr_init(dsr_if, listenport);
-		if (listenfd == -1) {
-			error("Can't initialize direct server return");
+	if (listenfd == -1) {
+		snprintf(listenport, sizeof listenport, "%s", argv[0]);
+		/* Direct server return */
+		if (dsr_if) {
+			listenfd = dsr_init(dsr_if, listenport);
+			if (listenfd == -1) {
+				error("Can't initialize direct server return");
+			}
+		} else {
+			listenfd = open_listener(listenport, udp ? SOCK_DGRAM : SOCK_STREAM);
 		}
-	} else {
-		listenfd = open_listener(listenport);
 	}
 	init(argc, argv);
 

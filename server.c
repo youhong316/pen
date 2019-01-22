@@ -46,15 +46,25 @@ static int pen_hash(struct sockaddr_storage *a)
 	struct sockaddr_in *si;
 	struct sockaddr_in6 *si6;
 	unsigned char *u;
+	int hash;
 
 	switch (a->ss_family) {
 	case AF_INET:
 		si = (struct sockaddr_in *)a;
-		return si->sin_addr.s_addr % nservers;
+		if (server_alg & ALG_ROUNDROBIN) {
+			hash = (si->sin_addr.s_addr ^ si->sin_port) % (nservers?nservers:1);
+		} else {
+			hash = si->sin_addr.s_addr % (nservers?nservers:1);
+		}
+
+		DEBUG(2, "Hash: %d", hash);
+
+		return hash;
+
 	case AF_INET6:
 		si6 = (struct sockaddr_in6 *)a;
 		u = (unsigned char *)(&si6->sin6_addr);
-		return u[15] % nservers;
+		return u[15] % (nservers?nservers:1);
 	default:
 		return 0;
 	}
@@ -63,7 +73,7 @@ static int pen_hash(struct sockaddr_storage *a)
 /* Introduce the new format "[address]:port:maxc:hard:weight:prio"
    in addition to the old one.
 */
-void setaddress(int server, char *s, int dp, char *proto)
+void setaddress(int server, char *s, int dp, int proto)
 {
 	char address[1024], pno[100];
 	int n;
@@ -86,7 +96,7 @@ void setaddress(int server, char *s, int dp, char *proto)
 	if (n < 5) servers[server].weight = 0;
 	if (n < 6) servers[server].prio = 0;
 
-	DEBUG(2, "n = %d, address = %s, pno = %d, maxc1 = %d, hard = %d, weight = %d, prio = %d, proto = %s ", \
+	DEBUG(2, "n = %d, address = %s, pno = %d, maxc1 = %d, hard = %d, weight = %d, prio = %d, proto = %d ", \
 		n, address, port, servers[server].maxc, \
 		servers[server].hard, servers[server].weight, \
 		servers[server].prio, proto);
@@ -171,7 +181,7 @@ int server_by_roundrobin(void)
 
 	if (nservers == 0) return NO_SERVER;
 	do {
-		i = (i+1) % nservers;
+		i = (i+1) % (nservers?nservers:1);
 		DEBUG(3, "server_by_roundrobin considering server %d", i);
 		if (!server_is_unavailable(i)) return (last_server = i);
 		DEBUG(3, "server %d is unavailable, try next one", i);
@@ -188,12 +198,15 @@ int initial_server(int conn)
 	if (!pd) {
 		DEBUG(1, "initial_server: denied by acl");
 		return abuse_server;
+		/* returning abuse_server is correct even if it is not set
+		   because it defaults to NO_SERVER */
 	}
 	if (!(server_alg & ALG_ROUNDROBIN)) {
 		// Load balancing with memory == No roundrobin
 		int server = clients[conns[conn].client].server;
 		/* server may be NO_SERVER if this is a new client */
 		if (server != NO_SERVER && server != emerg_server && server != abuse_server) {
+			DEBUG(2, "Will try previous server %d for client %d", server, conns[conn].client);
 			return server;
 		}
 	}
@@ -209,31 +222,41 @@ int initial_server(int conn)
 int failover_server(int conn)
 {
 	int server = conns[conn].server;
-	DEBUG(2, "failover_server(%d)", conn);
+	DEBUG(2, "failover_server(%d): server = %d", conn, server);
 	if (server_alg & ALG_STUBBORN) {
 		DEBUG(2, "Won't failover because we are stubborn");
 		close_conn(conn);
 		return 0;
 	}
-	if (server == abuse_server) {
-		DEBUG(2, "Won't failover from abuse server");
+	if (server == ABUSE_SERVER) {
+		DEBUG(2, "Won't failover from abuse server (%d)", abuse_server);
 		close_conn(conn);
 		return 0;
 	}
-	if (server == emerg_server) {
-		DEBUG(2, "Already using emergency server, won't fail over");
+	if (server == EMERGENCY_SERVER) {
+		DEBUG(2, "Already using emergency server (%d), won't fail over", emerg_server);
 		close_conn(conn);
 		return 0;
 	}
 	if (conns[conn].upfd != -1) {
+		if (conns[conn].state & CS_IN_PROGRESS) {
+			pending_list = dlist_remove(conns[conn].pend);
+			pending_queue--;
+		}
+
 		close(conns[conn].upfd);
 		conns[conn].upfd = -1;
 	}
-	do {
-		server = (server+1) % nservers;
-		DEBUG(2, "Intend to try server %d", server);
-		if (try_server(server, conn)) return 1;
-	} while (server != conns[conn].initial);
+	/* there needs to be at least two regular servers in order to fail over to something else */
+	/* and if we couldn't find a candidate for initial_server, we're not going to find one now */
+	if (nservers > 1 && server != NO_SERVER) {
+		DEBUG(2, "Trying to find failover server. server = %d, initial = %d, nservers = %d", server, conns[conn].initial, nservers);
+		do {
+			server = (server+1) % nservers;
+			DEBUG(2, "Intend to try server %d", server);
+			if (try_server(server, conn)) return 1;
+		} while (server != conns[conn].initial);
+	}
 	DEBUG(1, "using emergency server, remember to reset flag");
 	emergency = 1;
 	if (try_server(emerg_server, conn)) return 1;
@@ -307,8 +330,11 @@ int try_server(int index, int conn)
 	   even if the server is close to its configured connection limit */
 	int sticky = ((client != -1) && (index == clients[client].server));
 
+	if (index == NO_SERVER) {
+		DEBUG(2, "Won't try to connect to NO_SERVER");
+		return 0;	/* out of bounds */
+	}
 	DEBUG(2, "Trying server %d for connection %d at time %d", index, conn, now);
-	if (index < 0) return 0;	/* out of bounds */
 	if (pen_getport(addr) == 0) {
 		DEBUG(1, "No port for you!");
 		return 0;
@@ -328,7 +354,7 @@ int try_server(int index, int conn)
 		DEBUG(1, "try_server: denied by acl");
 		return 0;
 	}
-	upfd = socket_nb(addr->ss_family, protoid, 0);
+	upfd = socket_nb(addr->ss_family, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
 
 	if (keepalive) {
 		setsockopt(upfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&optval, sizeof optval);
@@ -340,7 +366,16 @@ int try_server(int index, int conn)
 	}
 	conns[conn].t = now;
 
-	if (transparent) spoof_bind(index, conn, upfd);
+	if (source) {
+		/* specify local address for upstream connection */
+		int n = bind(upfd, (struct sockaddr *)source, pen_ss_size(source));
+		if (n == -1) {
+			debug("bind: %s", strerror(errno));
+		}
+	} else if (transparent) {
+		/* use originating client's address for upstream connection */
+		spoof_bind(index, conn, upfd);
+	}
 
 	n = connect(upfd, (struct sockaddr *)addr, pen_ss_size(addr));
 	err = socket_errno;
@@ -354,7 +389,7 @@ int try_server(int index, int conn)
 			conns[conn].state |= CS_CLOSED_DOWN;
 		}
 		event_add(upfd, EVENT_READ);
-		if (!udp) event_add(conns[conn].downfd, EVENT_READ);
+		event_add(conns[conn].downfd, EVENT_READ);
 		servers[index].c++;
 		if (servers[index].status) {
 			servers[index].status = 0;
@@ -385,6 +420,8 @@ int try_server(int index, int conn)
 		return 0;
 	}
 	conns[conn].server = index;
+	DEBUG(2, "Setting server %d for client %d", index, client);
+	clients[client].server = index;
 	current = index;
 	conns[conn].upfd = upfd;
 	fd2conn_set(upfd, conn);

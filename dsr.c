@@ -2,11 +2,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include "acl.h"
 #include "pen.h"
 #include "diag.h"
 #include "memory.h"
 #include "server.h"
 #include "settings.h"
+
+int tarpit_acl = -1;
 
 #if defined(HAVE_LINUX_IF_PACKET_H) || defined(HAVE_NET_NETMAP_USER_H)
 #include <stdlib.h>
@@ -81,6 +84,58 @@ static void hexdump(uint8_t *b, int n)
 #define IPV4_PROTOCOL(f) (uint8_t *)(PAYLOAD(f)+9)
 #define IPV4_SRC(f) (struct in_addr *)(PAYLOAD(f)+12)
 #define IPV4_DST(f) (struct in_addr *)(PAYLOAD(f)+16)
+
+#define TCP_SEGMENT(f, i) (PAYLOAD(f)+i)
+#define TCP_SRC_PORT(f, i) (uint16_t *)(TCP_SEGMENT(f, i))
+#define TCP_DST_PORT(f, i) (uint16_t *)(TCP_SEGMENT(f, i)+2)
+#define TCP_SEQ_NR(f, i) (uint32_t *)(TCP_SEGMENT(f, i)+4)
+#define TCP_ACK_NR(f, i) (uint32_t *)(TCP_SEGMENT(f, i)+8)
+#define TCP_FLAGS(f, i) (uint16_t *)(TCP_SEGMENT(f, i)+12)
+#define TCP_WINDOW(f, i) (uint16_t *)(TCP_SEGMENT(f, i)+14)
+#define TCP_CHECKSUM(f, i) (uint16_t *)(TCP_SEGMENT(f, i)+16)
+#define TCP_URGENT(f, i) (uint16_t *)(TCP_SEGMENT(f, i)+18)
+#define TCP_OPTIONS(f, i) (uint8_t *)(TCP_SEGMENT(f, i)+20)
+
+#define UDP_SEGMENT(f, i) (PAYLOAD(f)+i)
+#define UDP_SRC_PORT(f, i) (uint16_t *)(UDP_SEGMENT(f, i))
+#define UDP_DST_PORT(f, i) (uint16_t *)(UDP_SEGMENT(f, i)+2)
+
+struct l2_frame {
+	uint8_t mac_dst[6];
+	uint8_t mac_src[6];
+	uint16_t ethertype;
+	uint8_t payload[1500];
+};
+
+struct ip_header {
+	uint8_t ver_ihl, dscp_ecn;
+	uint16_t length;
+	uint16_t id, flags_offset;
+	uint8_t ttl, proto;
+	uint16_t header_cksum;
+	uint32_t src, dst;
+	uint32_t options;
+};
+
+struct pseudo_header {
+	uint32_t src, dst;
+	uint8_t zero, proto;
+	uint16_t length;
+};
+
+struct tcp_header {
+	uint16_t sport, dport;
+	uint32_t seqnr;
+	uint32_t acknr;
+	uint16_t flags, winsize;
+	uint16_t cksum, urgent;
+	uint8_t options[40];
+};
+
+struct udp_header {
+	uint16_t sport, dport;
+	uint16_t length, cksum;
+};
 
 static int port;
 
@@ -279,9 +334,22 @@ static void store_hwaddr(struct in_addr *ip, uint8_t *hw)
 	}
 }
 
+/* returns 1 if this is an arp request for us, 0 otherwise */
+static int our_arp(uint16_t arp_htype, uint16_t arp_ptype, uint16_t arp_oper, struct sockaddr_in *dest)
+{
+	if ((arp_htype != 1) || (arp_ptype != 0x0800) || (arp_oper != 1)) return 0;
+
+	if (memcmp(&dest->sin_addr.s_addr, &our_ip_addr, 4) == 0) return 1;
+
+	return match_acl(tarpit_acl, (struct sockaddr_storage *)dest);
+}
+
 static void arp_frame(int fd, int n)
 {
 	uint16_t arp_htype, arp_ptype, arp_oper;
+	struct sockaddr_in dest;
+	memcpy(&dest.sin_addr.s_addr, ARP_TPA(buf), 4);
+	dest.sin_family = AF_INET;
 	DEBUG(2, "ARP");
 	arp_htype = ntohs(*ARP_HTYPE(buf));
 	arp_ptype = ntohs(*ARP_PTYPE(buf));
@@ -297,10 +365,7 @@ static void arp_frame(int fd, int n)
 	DEBUG(2, "Sender protocol address: %s", inet_ntoa(*ARP_SPA(buf)));
 	DEBUG(2, "Target hardware address: %s", mac2str(ARP_THA(buf)));
 	DEBUG(2, "Target protocol address: %s", inet_ntoa(*ARP_TPA(buf)));
-	if ((arp_htype == 1) &&
-	    (arp_ptype == 0x0800) &&
-	    (arp_oper == 1) &&
-	    (memcmp(ARP_TPA(buf), &our_ip_addr, sizeof *ARP_TPA(buf)) == 0)) {
+	if (our_arp(arp_htype, arp_ptype, arp_oper, &dest)) {
 		hexdump(buf, n);
 		DEBUG(2, "We should reply to this.");
 		memcpy(MAC_DST(buf), ARP_SHA(buf), 6);
@@ -309,7 +374,8 @@ static void arp_frame(int fd, int n)
 		memcpy(ARP_THA(buf), ARP_SHA(buf), 6);
 		memcpy(ARP_TPA(buf), ARP_SPA(buf), 4);
 		memcpy(ARP_SHA(buf), our_hw_addr, 6);
-		memcpy(ARP_SPA(buf), &our_ip_addr, 4);
+//		memcpy(ARP_SPA(buf), &our_ip_addr, 4);
+		memcpy(ARP_SPA(buf), &dest.sin_addr.s_addr, 4);
 		DEBUG(2, "Sending %d bytes", n);
 		n = send_packet(fd, buf, n);
 	} else if ((arp_htype == 1) &&
@@ -382,13 +448,6 @@ static int rebuild_hash_index(void)
 		t--;
 	}
 
-#if 0
-for (i = 0; i < HASH_INDEX_SIZE; i++) {
-printf("%d ", hash_index[i]);
-}
-printf("\n");
-#endif
-
 	/* finally claim that the hash index is up to date */
 	server_alg |= ALG_HASH_VALID;
 	free(s);
@@ -418,12 +477,6 @@ static int select_server(struct in_addr *a, uint16_t port)
 	return i;
 }
 
-#define TCP_SEGMENT(f, i) (PAYLOAD(f)+i)
-#define TCP_SRC_PORT(f, i) (uint16_t *)(TCP_SEGMENT(f, i))
-#define TCP_DST_PORT(f, i) (uint16_t *)(TCP_SEGMENT(f, i)+2)
-#define UDP_SEGMENT(f, i) (PAYLOAD(f)+i)
-#define UDP_SRC_PORT(f, i) (uint16_t *)(UDP_SEGMENT(f, i))
-#define UDP_DST_PORT(f, i) (uint16_t *)(UDP_SEGMENT(f, i)+2)
 
 static int ipv4_frame(int fd, int n)
 {
@@ -431,6 +484,7 @@ static int ipv4_frame(int fd, int n)
 	uint8_t ipv4_ihl;
 	uint16_t src_port, dst_port;
 	int server;
+	struct sockaddr_in dest;
 
 	DEBUG(2, "IPv4");
 	ipv4_ihl = ((*IPV4_IHL(buf)) & 0xf)*4;
@@ -439,8 +493,12 @@ static int ipv4_frame(int fd, int n)
 	DEBUG(2, "Protocol: %d / %s", ipv4_protocol, proto2str(ipv4_protocol));
 	DEBUG(2, "Sender IPv4 address: %s", inet_ntoa(*IPV4_SRC(buf)));
 	DEBUG(2, "Destination IPv4 address: %s", inet_ntoa(*IPV4_DST(buf)));
+
+	dest.sin_family = AF_INET;
+	dest.sin_addr = *IPV4_DST(buf);
+
 	if (udp) {
-DEBUG(3, "Doing udp");
+		DEBUG(3, "Doing udp");
 		if ((ipv4_protocol == 17) &&
 		    (*(uint32_t *)IPV4_DST(buf) == (uint32_t)our_ip_addr.s_addr)) {
 			DEBUG(2, "We should forward this.");
@@ -459,32 +517,97 @@ DEBUG(3, "Doing udp");
 				src_port, dst_port);
 			if (port == 0 || dst_port == port) {
 				memcpy(MAC_DST(buf), servers[server].hwaddr, 6);
+				memcpy(MAC_SRC(buf), our_hw_addr, 6);
 				DEBUG(2, "Sending %d bytes", n);
 				n = send_packet(fd, buf, n);
 			}
 		}
 	} else {	/* not udp, i.e. tcp */
-DEBUG(3, "Doing tcp");
-		if ((ipv4_protocol == 6) &&
-		    (*(uint32_t *)IPV4_DST(buf) == (uint32_t)our_ip_addr.s_addr)) {
-			DEBUG(2, "We should forward this.");
-			src_port = htons(*TCP_SRC_PORT(buf, ipv4_ihl));
-			dst_port = htons(*TCP_DST_PORT(buf, ipv4_ihl));
-			server = select_server(IPV4_SRC(buf), src_port);
-			if (server == NO_SERVER) {
-				debug("Dropping frame, nowhere to put it");
-				return -1;
-			}
-			if (!real_hw_known(server)) {
-				DEBUG(2, "Real hw addr unknown");
-				return -1;
-			}
-			DEBUG(2, "Source port = %d, destination port = %d",
-				src_port, dst_port);
-			if (port == 0 || dst_port == port) {
-				memcpy(MAC_DST(buf), servers[server].hwaddr, 6);
-				DEBUG(2, "Sending %d bytes", n);
+		DEBUG(3, "Doing tcp");
+		if (ipv4_protocol == 6) {
+			if (match_acl(tarpit_acl, (struct sockaddr_storage *)&dest)) {
+				struct pseudo_header ph;
+				int i;
+				unsigned char src_mac[6];
+				uint32_t seq_nr;
+				uint16_t flags = ntohs(*TCP_FLAGS(buf, ipv4_ihl));
+				uint32_t checksum;
+				uint16_t *csp;
+
+				DEBUG(2, "Tarpitting: flags = 0x%x");
+				if ((flags & 0x0002) == 0) return 0;		/* not SYN */
+				/* fill in the pseudo header fields */
+				memcpy(&ph.src, IPV4_DST(buf), 4);
+				memcpy(&ph.dst, IPV4_SRC(buf), 4);
+				ph.zero = 0;		/* :P */
+				ph.proto = 6;	/* tcp */
+				ph.length = htons(40);		/* 5 32-bit words */
+
+				DEBUG(2, "We should tarpit this");
+				/* reverse everything to make the syn+ack frame */
+				/* reverse mac addresses */
+				memcpy(src_mac, MAC_SRC(buf), 6);
+				memcpy(MAC_SRC(buf), MAC_DST(buf), 6);
+				memcpy(MAC_DST(buf), src_mac, 6);
+				/* reverse ip addresses */
+				*IPV4_DST(buf) = *IPV4_SRC(buf);
+				*IPV4_SRC(buf) = dest.sin_addr;
+				/* reverse port numbers */
+				src_port = ntohs(*TCP_SRC_PORT(buf, ipv4_ihl));
+				*TCP_SRC_PORT(buf, ipv4_ihl) = *TCP_DST_PORT(buf, ipv4_ihl);
+				*TCP_DST_PORT(buf, ipv4_ihl) = htons(src_port);
+				/* reverse sequence numbers */
+				seq_nr = ntohl(*TCP_SEQ_NR(buf, ipv4_ihl));
+				*TCP_SEQ_NR(buf, ipv4_ihl) = htonl(42);	/* our random number */
+				*TCP_ACK_NR(buf, ipv4_ihl) = htonl(seq_nr+1);
+				/* 5 words of tcp header and SYN+ACK */
+				*TCP_FLAGS(buf, ipv4_ihl) = htons((5 << 12) | 0x0012);
+				*TCP_CHECKSUM(buf, ipv4_ihl) = 0;
+				*TCP_URGENT(buf, ipv4_ihl) = 0;
+				checksum = 0;
+				csp = (uint16_t *)&ph;
+				for (i = 0; i < 6; i++) {
+					checksum += ntohs(csp[i]);
+				}
+				csp = (uint16_t *)TCP_SRC_PORT(buf, ipv4_ihl);
+				for (i = 0; i < 10; i++) {
+					checksum += ntohs(csp[i]);
+				}
+				checksum = (checksum & 0xffff) + (checksum >> 16);
+				checksum ^= 0xffff;
+				*TCP_CHECKSUM(buf, ipv4_ihl) = htons(checksum);
+				DEBUG(2, "Checksum = 0x%x", checksum);
+				/* ignore options */
+				uint8_t offset = (flags >> 12);
+				DEBUG(2, "Offset = %d => %d bytes of options", offset, 4*(offset-5));
+				uint8_t *options = TCP_OPTIONS(buf, ipv4_ihl);
+				DEBUG(2, "Options start at %p", options);
+				i = 0;
+				for (i = 0; i < 4*(offset-5); i++) {
+					options[i] = 0;
+				}
 				n = send_packet(fd, buf, n);
+			} else if (*(uint32_t *)IPV4_DST(buf) == (uint32_t)our_ip_addr.s_addr) {
+				DEBUG(2, "We should forward this.");
+				src_port = ntohs(*TCP_SRC_PORT(buf, ipv4_ihl));
+				dst_port = ntohs(*TCP_DST_PORT(buf, ipv4_ihl));
+				server = select_server(IPV4_SRC(buf), src_port);
+				if (server == NO_SERVER) {
+					debug("Dropping frame, nowhere to put it");
+					return -1;
+				}
+				if (!real_hw_known(server)) {
+					DEBUG(2, "Real hw addr unknown");
+					return -1;
+				}
+				DEBUG(2, "Source port = %d, destination port = %d",
+					src_port, dst_port);
+				if (port == 0 || dst_port == port) {
+					memcpy(MAC_DST(buf), servers[server].hwaddr, 6);
+					memcpy(MAC_SRC(buf), our_hw_addr, 6);
+					DEBUG(2, "Sending %d bytes", n);
+					n = send_packet(fd, buf, n);
+				}
 			}
 		}
 	}
@@ -524,6 +647,7 @@ void dsr_frame(int fd)
 {
 	int i, type, n, limit;
 	static int dirty_bytes = 0;
+	struct l2_frame *l2p = (struct l2_frame *)buf;
 
 	if (dirty_bytes) {
 		DEBUG(1, "Retrying transmission of %d bytes", dirty_bytes);
@@ -541,9 +665,9 @@ void dsr_frame(int fd)
 			dirty_bytes = 0;
 			break;
 		}
-		DEBUG(2, "MAC destination: %s", mac2str(MAC_DST(buf)));
-		DEBUG(2, "MAC source: %s", mac2str(MAC_SRC(buf)));
-		type = ntohs(*ETHERTYPE(buf));
+		DEBUG(2, "MAC destination: %s", mac2str(l2p->mac_dst));
+		DEBUG(2, "MAC source: %s", mac2str(l2p->mac_src));
+		type = ntohs(l2p->ethertype);
 		DEBUG(2, "EtherType: %s", type2str(type));
 		switch (type) {
 		case 0x0806:
